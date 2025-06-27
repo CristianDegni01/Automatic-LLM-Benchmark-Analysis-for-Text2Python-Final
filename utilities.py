@@ -34,12 +34,10 @@ def carica_sqlite(file_path, db_id):
     data_output = {'data_frames': extract_dataframes(file_path),'db': SqliteConnector(relative_db_path=file_path, db_name=db_id)}
     return data_output
 
-# Funzione per leggere un file CSV
 def load_csv(file):
     df = pd.read_csv(file)
     return df
 
-# Funzione per leggere un file Excel
 def carica_excel(file):
     xls = pd.ExcelFile(file)
     dfs = {}
@@ -131,13 +129,18 @@ def extract_tables_dict(pnp_path):
     return tables_dict
 
 
-def extract_answer(df):
-    if "query" not in df.columns or "db_path" not in df.columns:
+def extract_answer(df, query_column = None, results_column = None):
+    if ("query" not in df.columns and query_column == None ) or "db_path" not in df.columns:
         raise ValueError("The DataFrame must contain 'query' and 'db_path' columns.")
     
     answers = []
+    if query_column is None:
+        query_column = "query"
+    if results_column is None:
+        results_column = "target_answer"
+
     for _, row in df.iterrows():
-        query = row["query"]
+        query = row[query_column]
         db_path = row["db_path"]
         try: 
             conn = sqlite3.connect(db_path)
@@ -150,7 +153,7 @@ def extract_answer(df):
         except Exception as e:
             answers.append(f"Error: {e}")
     
-    df["target_answer"] = answers
+    df[results_column] = answers
     return df
 
 evaluator = {
