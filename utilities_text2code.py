@@ -3,6 +3,7 @@ import time
 import pandas as pd
 import re
 import ast
+import numpy as np
 from litellm import completion
 from dotenv import load_dotenv
 load_dotenv()
@@ -23,6 +24,10 @@ import ast
 import sqlite3
 from tqdm import tqdm
 import json
+import pandas as pd
+import docker
+import tempfile
+import os
 
 # First prompt for the generation of steps in NL to solve later the question with python code
 prompt_steps = """
@@ -48,6 +53,7 @@ The tables are stored as CSV files named exactly as the table names.
 
 Schema: {db_schema}
 Question: {question}
+Example of entries: {entries}
 """
 
 # Second prompt that solves the question by writing python code based on the reasoning steps previously generated
@@ -59,9 +65,9 @@ Generate Python code to answer the given question by following the provided reas
 - The code must be valid, complete, and executable.
 - Use standard pandas operations for data filtering, transformation, and aggregation.
 - If any intermediate result is required by the reasoning steps, include it in the code.
-- The code should print as output a list of lists, where each inner list is a row of the table.
+- The code should be provide as ouput a list of list , where each element are value of the columns strictly necessary to answer the question.
 - Keep the type of the columns as in the original table.
-- Output format must be EXACTLY like: [[...], [...]]
+- Print the output.
 Do not add explanations or comments—just return the code.
 
 Schema: {db_schema}
@@ -97,7 +103,7 @@ qa_map returns the passed table filtered on the columns for the specified sub qu
 You MUST DO NOT DEFINE the qa_map function, just use it in the code.
 Tables in the database schema are stored in csv files, there is no need to define them.
 Filenames of the csv files are the same as the table names.
-The code should be provide as ouput a list of list , where each element are value strictly necessary to answer the question.
+The code should be provide as ouput a list of list , where each element are value of the columns strictly necessary to answer the question.
 You must print the final reslut.
 
 Schema: 
@@ -105,8 +111,12 @@ Schema:
 
 Question: 
 {question}
+
+Example of entries: 
+{entries}
 """
 
+#Binder prompt 2
 prompt_mapping = """
 You are given the definition of the function `qa_map(db: pd.DataFrame, question: str, columns: List[str])`, which uses a question-answering model to transform tabular data by interpreting the meaning of certain column(s) in the context of a natural language question.
 
@@ -145,7 +155,7 @@ Table Name: animals.csv
 ```
 """
 
-#simple python
+#simple/vanilla python
 prompt_simple = """
 You are a code generator. You will be provided with a natural question, a database schema and some example entries.
 Your task is to generate a Python code that answers the natural question using the provided database schema.
@@ -153,25 +163,27 @@ You can use the example entries to understand the structure of the database and 
 The code should be in '''python''' format and should be executable.
 Tables in the database schema are stored in csv files, that you should use to answer the natural question.
 Filenames of the csv files are the same as the table names.
+Do not make assumptions, use the joins rules and mapping for answer the question.
 
-The code should print as output a list of lists, where each inner list is a row of the table.
-Schema: {db_schema}
+The code should be provide as ouput a list of list , where each element are value of the columns strictly necessary to answer the question.
 Question: {question}
+Schema: {db_schema}
+Example of entries: {samples}
 """ 
 
 #text2sql
 prompt_text_sql ="""
 Translate the following question in SQL code to be executed over the database to fetch the answer. Return the sql code in ```sql ```
-Question
+Question:
 {question}
-Database Schema
+Database Schema:
 {db_schema}
 """
 
 #text2answer
 prompt_text_answer = """
 Return the answer of the following question based on the provided database. Return your answer as the result of a query executed over the database.
-Namely, as a list of list where the first list represent the tuples and the second list the values in that tuple.
+The code should be provide as ouput a list of list [[...],[...]], where each element are value of the columns strictly necessary to answer the question.
 Return ONLY the answer in answer tag as <answer> </answer>.
 Question: 
 {question}
@@ -211,14 +223,16 @@ def create_sub_db(source_db):
 
     for table in tables:
         #Schema of each table
-        src_cursor.execute(f"SELECT sql FROM sqlite_master WHERE type='table' AND name='{table}'")
+        src_cursor.execute(f"SELECT sql FROM sqlite_master WHERE type='table' AND name='{table}'") #DADA
+        #src_cursor.execute(f"SELECT sql FROM sqlite_master WHERE type='table' AND name=\"{table}\"")
         create_table_sql = src_cursor.fetchone()[0]
 
         #Craete a new table in the new DB
         tgt_cursor.execute(create_table_sql)
 
         # Extract first 10 rows
-        src_cursor.execute(f"SELECT * FROM {table} LIMIT 10")
+        src_cursor.execute(f'SELECT * FROM {table} LIMIT 10') #DADA
+        #src_cursor.execute(f'SELECT * FROM "{table}" LIMIT 10')
         rows = src_cursor.fetchall()
 
         #  Get colums name
@@ -228,7 +242,8 @@ def create_sub_db(source_db):
         placeholders = ", ".join(["?"] * len(columns))
 
         # Insert into new DB
-        insert_sql = f"INSERT INTO {table} ({columns_str}) VALUES ({placeholders})"
+        insert_sql = f"INSERT INTO {table} ({columns_str}) VALUES ({placeholders})" #DADA
+        #insert_sql = f'INSERT INTO "{table}" ({columns_str}) VALUES ({placeholders})'
         tgt_cursor.executemany(insert_sql, rows)
 
     tgt_conn.commit()
@@ -236,6 +251,54 @@ def create_sub_db(source_db):
     tgt_conn.close()
 
     return target_db
+
+def return_istances(source_db):
+    conn = sqlite3.connect(source_db)
+    cursor = conn.cursor()
+
+    cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")
+    tables = [row[0] for row in cursor.fetchall()]
+
+    insert_statements = []
+    for table in tables:
+        cursor.execute(f"SELECT * FROM {table} LIMIT 10") #DADA
+        #cursor.execute(f'SELECT * FROM "{table}" LIMIT 10') 
+        rows = cursor.fetchall()
+
+        cursor.execute(f"PRAGMA table_info({table})")
+        columns = [row[1] for row in cursor.fetchall()]
+        columns_str = ", ".join([f'"{col}"' for col in columns])
+
+        for row in rows:
+            values_str = ", ".join([f"'{value}'" if isinstance(value, str) else str(value) for value in row])
+            insert_statements.append(f"INSERT INTO {table} ({columns_str}) VALUES ({values_str});")
+
+    conn.close()
+    return "\n".join(insert_statements)
+
+def read_first_10_instances_from_db(db_path):
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
+
+    cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")
+    tables = [row[0] for row in cursor.fetchall()]
+
+    table_data = {}
+    for table in tables:
+        cursor.execute(f"SELECT * FROM {table} LIMIT 10")
+        rows = cursor.fetchall()
+
+        cursor.execute(f"PRAGMA table_info({table})")
+        columns = [row[1] for row in cursor.fetchall()]
+
+        table_data[table] = pd.DataFrame(rows, columns=columns)
+
+    conn.close()
+    table_data_str = ""
+    for table_name, df in table_data.items():
+        table_data_str += f"Table Name: {table_name}\n"
+        table_data_str += df.to_string(index=False) + "\n\n"
+    return table_data_str
 
 def qatch_generate_tests(task, database_path : str | None = None , database_name: str | None = None, num_entries = 3):    
     if (database_path == None and database_name == None):
@@ -258,7 +321,6 @@ def qatch_generate_tests(task, database_path : str | None = None , database_name
         #crop the database for fitting in the prompt
         if (task == "text2answer"):
             database_path = create_sub_db(database_path)
-            #TODO CHECK IF ENTRIES WORKS
             num_entries = 10
         db_connector = SqliteConnector(relative_db_path = database_path, db_name = database_name)
 
@@ -340,9 +402,10 @@ def extract_results(output: str):
     return lista_di_liste, runtime
 
 def code_execution(predicted_code : str, tables_csv, sbx):    
+
     for csv_path in tables_csv:
-        with open(csv_path, "rb") as f:
-            sbx.files.write(f"{csv_path}", f.read())
+         with open(csv_path, "rb") as f:
+             sbx.files.write(f"{os.path.basename(csv_path)}", f.read())
 
     predicted_code = f"""
 import time
@@ -366,7 +429,7 @@ def extract_answer_from_response(response: str):
 
         json_str = re.search(r"<json>(.*?)</json>", response, re.DOTALL).group(1)
 
-        json_str = json_str.replace("'", '"')  # correzione base
+        json_str = json_str.replace("'", '"') 
 
         try:
             data = json.loads(json_str)
@@ -378,14 +441,16 @@ def extract_answer_from_response(response: str):
         return None
 
 def predict_code(prompt, task, model="together_ai/meta-llama/Meta-Llama-3.1-70B-Instruct-Turbo", answer=False):
-    # TODO: role system (oltre che user)
-    start_time = time.time()
-    response = completion(
-        model=model,
-        messages=[{"role": "user", "content": prompt}],
-        num_retries=2
-    )
-    end_time = time.time()
+    try :
+        start_time = time.time()
+        response = completion(
+            model=model,
+            messages=[{"role": "user", "content": prompt}],
+            num_retries=2
+        )
+        end_time = time.time()
+    except Exception as e:
+        return 'Over token', 0.0 , 0.0
     if answer:
         answer_map = extract_answer_from_response(response['choices'][0]['message']['content'])
         return answer_map, response._hidden_params["response_cost"], end_time - start_time
@@ -461,13 +526,13 @@ def generate_prompt(type, question, db_schema : str | None = None, samples : lis
     prompt = ""
     #  Codex Python prompts
     if (type == 'steps'):
-        prompt = prompt_steps.format(question=question, db_schema=db_schema) 
+        prompt = prompt_steps.format(question=question, db_schema=db_schema, entries=samples ) 
     elif (type == 'final'):
         prompt = prompt_final.format(question = question, db_schema=db_schema, reasoning_steps = reasoning_steps)
 
     #  Binder prompts
     elif (type == 'neural_python'):
-        prompt = prompt_neural_python.format(question=question, db_schema=db_schema) 
+        prompt = prompt_neural_python.format(question=question, db_schema=db_schema, entries=samples) 
     elif (type == 'mapping'):
         for table_name, df in database.items():
             database_str = f"Table Name: {table_name}"+"\nIstances:\n"+df+"\n\n"
@@ -475,7 +540,7 @@ def generate_prompt(type, question, db_schema : str | None = None, samples : lis
 
     #  Simple Python prompt
     elif (type == 'simple_python'):
-        prompt = prompt_simple.format(question=question, db_schema=db_schema)
+        prompt = prompt_simple.format(question=question, db_schema=db_schema, samples=samples)
 
     # Text to answer task   
     elif(type == 'text2answer'):
@@ -523,7 +588,12 @@ def extract_qa_map_calls(code: str) -> List[Dict[str, object]]:
                     print(f"Error parsing qa_map call: {e}")
             self.generic_visit(node)
 
-    tree = ast.parse(code)
+    try:
+        tree = ast.parse(code)
+    except SyntaxError as e:
+        print(f"Syntax error in code: {e}")
+        return []
+
     visitor = QaMapVisitor()
     visitor.visit(tree)
     return visitor.calls
@@ -567,44 +637,49 @@ def prediction(task, df, models, question_column, tables_csv):
                     final_code, final_cost, final_time = predict_code(model = model, prompt = prompt, task=task)
 
                 case "binder_python":
-                    print(row[question_column])
-                    if (row[question_column] != 'Find the city with the largest population that uses English.'and row[question_column] != 'Which cities are in European countries where English is not the official language?' and row[question_column]!= 'What are the names of cities in Europe for which English is not the official language?'):
-                        prompt = generate_prompt(type = "neural_python", question = row[question_column], db_schema = row['db_schema'], samples = row["entries"])
-                        #prompt = generate_prompt(type = "neural_python", question = "Count the number of people who live in United States of America", db_schema = row['db_schema'], samples = row["entries"])
-                        try:
-                            code, cost, time = predict_code(model = model, prompt = prompt, task=task)
-                        except Exception as e:
-                            code="""Over max tokens limit"""
-                            cost=0 
-                            time =0
-                        costs = cost
-                        times = time
-                        if "qa_map" in code:
-                            qa_map_invocations = extract_qa_map_calls(code)
-                            for qa_map_invocation in qa_map_invocations:
-                                if (qa_map_invocation["db"] is not None and qa_map_invocation["question"] is not None and qa_map_invocation["columns"] is not []):
-                                    # Extrac sub table
-                                    tables_json = {}
-                                    try:
-                                        df_csv = pd.read_csv(qa_map_invocation["db"])
-                                    except Exception as e:
-                                        df_csv = pd.DataFrame()
-                                        df_csv = pd.DataFrame(columns=qa_map_invocation["columns"])
-                                    valid_columns = [col for col in qa_map_invocation["columns"] if col in df_csv.columns]
-                                    sub_table = df_csv[valid_columns]
-                                    sub_table_json = sub_table.to_json(orient="records")
-                                    tables_json[qa_map_invocation["db"]] = sub_table_json
-                                    prompt = generate_prompt(type = "mapping", question = qa_map_invocation["question"], database = tables_json)
+                    #print(row[question_column])
+                    #if (row[question_column] != 'Find the city with the largest population that uses English.'and row[question_column] != 'Which cities are in European countries where English is not the official language?' and row[question_column]!= 'Return the different names of cities that are in Asia and for which Chinese is the official language.'):
+                    prompt = generate_prompt(type = "neural_python", question = row[question_column], db_schema = row['db_schema'], samples = row["entries"])
+                    #prompt = generate_prompt(type = "neural_python", question = "Count the number of people who live in United States of America", db_schema = row['db_schema'], samples = row["entries"])
+                    try:
+                        code, cost, time = predict_code(model = model, prompt = prompt, task=task)
+                    except Exception as e:
+                        code="""Prediction error"""
+                        cost=0 
+                        time =0
+                    costs = cost
+                    times = time
+                    if "qa_map" in code:
+                        qa_map_invocations = extract_qa_map_calls(code)
+                        for qa_map_invocation in qa_map_invocations:
+                            if (qa_map_invocation["db"] is not None and qa_map_invocation["question"] is not None and qa_map_invocation["columns"] is not []):
+                                # Extrac sub table
+                                tables_json = {}
+                                try:
+                                    df_csv = pd.read_csv(qa_map_invocation["db"])
+                                except Exception as e:
+                                    df_csv = pd.DataFrame()
+                                    df_csv = pd.DataFrame(columns=qa_map_invocation["columns"])
+                                valid_columns = [col for col in qa_map_invocation["columns"] if col in df_csv.columns]
+                                sub_table = df_csv[valid_columns]
+                                sub_table_json = sub_table.to_json(orient="records")
+                                tables_json[qa_map_invocation["db"]] = sub_table_json
+                                prompt = generate_prompt(type = "mapping", question = qa_map_invocation["question"], database = tables_json)
+                                try :
                                     answer, cost, time = predict_code(model = model, prompt = prompt, task=task, answer=True)
-                                    costs += cost
-                                    times += time
+                                except Exception as e:
+                                    answer=None
+                                    cost=0 
+                                    time =0
+                                costs += cost
+                                times += time
 
-                                    pd.DataFrame(columns=df_csv.columns).to_csv(f"map{j}.csv", index=False)
-                                    if answer is not None:
+                                pd.DataFrame(columns=df_csv.columns).to_csv(f"map{j}.csv", index=False)
+
+                                if answer is not None:
+                                    if (isinstance(answer, str) and answer != "Over token"):
+                                        print(answer)
                                         answer.to_csv(f"map{j}.csv", index=False)
-                                        # Apply filter to qa_map_invocation["db"]
-                                        #answer = answer.dropna()
-                                        #filtered_df = df_csv[df_csv[qa_map_invocation["columns"]].isin(answer[qa_map_invocation["columns"]])]
                                         try:
                                             df_csv = pd.read_csv(qa_map_invocation["db"])
                                             filtered_df = pd.merge(
@@ -616,20 +691,15 @@ def prediction(task, df, models, question_column, tables_csv):
                                         except Exception as e:
                                             filtered_df = pd.DataFrame(columns=df_csv.columns)
                                             filtered_df.to_csv(f"map{j}.csv", index=False)
-                                    code = re.sub( r"\s*qa_map\(.*?\)", f" pd.read_csv('map{j}.csv')",code)
-                                    tables_csv.append(f"map{j}.csv")
-                                    j+=1
-                    else:
-                        code = ""
-                        costs = 0
-                        times = 0
+                                code = re.sub( r"\s*qa_map\(.*?\)", f" pd.read_csv('map{j}.csv')",code)
+                                tables_csv.append(f"map{j}.csv")
+                                j+=1
                     final_code = code
                     final_cost = costs
                     final_time = times
-                
                 case "text2sql":
                     df.at[i, "predicted_sql"] = None
-                    prompt = generate_prompt(type = "text2sql", question = row[question_column], db_schema = row['db_schema'])
+                    prompt = generate_prompt(type = "text2sql", question = row[question_column], db_schema = row['db_schema'], samples = row["entries"])
                     predictected_query, final_cost, final_time = predict_code(model = model, prompt = prompt, task = task)
                     df.at[i, "predicted_sql"] = predictected_query
                 case "text2answer":
@@ -659,10 +729,11 @@ def execution(df_target, tables_csv):
         df_target.at[i, "raw_output"]=None
 
         #Espand Sandbox time out (usually 5 minutes)
-        sbx.set_timeout(120_000)
+        sbx.set_timeout(240_000)
 
         #Run the predicted code and collect the results
         returned_results = code_execution(row["predicted_code"], tables_csv, sbx)
+
         df_target.at[i, "predicted_answer"] = returned_results['answer']
         df_target.at[i, "runtime"]   = returned_results['runtime']
         df_target.at[i, "raw_output"] = returned_results['raw_output']
@@ -670,3 +741,22 @@ def execution(df_target, tables_csv):
     sbx.kill()
 
     return df_target
+
+def create_database_from_csv(tables_csv):
+    print ("----", tables_csv)
+    # Create a new SQLite database
+    db_path = "temp_database.sqlite"
+    if os.path.exists(db_path):
+        os.remove(db_path)
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
+
+    # Iterate over the CSV files and create tables
+    for csv_file in tables_csv:
+        table_name = os.path.splitext(os.path.basename(csv_file))[0]
+        df = pd.read_csv(csv_file)
+        df.to_sql(table_name, conn, if_exists="replace", index=False)
+
+    conn.commit()
+    conn.close()
+    return db_path
